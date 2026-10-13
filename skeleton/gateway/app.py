@@ -97,7 +97,46 @@ class JsonGateway:
 
     目标：``tests/test_app.py`` 的 ``test_handle_request_*`` 与 ``test_run_*`` 通过。
         """
-        raise NotImplementedError("TODO 10：实现 handle_request（见函数文档里的提示）")
+        notes: List[str] = []
+        decision: Optional[Dict[str, Any]] = None
+
+        # 只有在线模式才碰网络；离线模式直接跳到下面的本地兜底。
+        if self.client is not None:
+            try:
+                content, meta = self.client.decide(request)
+                # 模型输出是不可信文本，先过 JSON 容错层，再过字段校验层。
+                candidate = loads_object(content)
+                decision, notes = validate_decision(candidate, request)
+                # 诊断信息只进日志，绝不能塞进 notes：notes 是给调用方看的「修正说明」。
+                self.log(
+                    "上游耗时 %.2fs（attempt=%s, finish_reason=%s, 含思维链=%s）"
+                    % (
+                        float(meta.get("latency_s") or 0.0),
+                        meta.get("attempt"),
+                        meta.get("finish_reason"),
+                        meta.get("has_reasoning"),
+                    )
+                )
+            except JsonGuardError as exc:
+                # 模型胡说八道（整理不出 JSON 对象），decision 保持 None 走兜底。
+                notes.append("模型输出无法整理成 JSON: %s" % exc)
+                self.log(str(exc))
+            except Exception as exc:  # noqa: BLE001 - 上游任何问题都不允许影响出拳
+                # 超时、连接失败、非 2xx、客户端自身异常……全部接住。
+                notes.append("上游异常: %s" % exc)
+                self.log(str(exc))
+
+        # 兜底：模型没给出可用决策时，本地一定要给出一个合法出拳。
+        if decision is None:
+            decision, extra = fallback_decision(request)
+            notes = notes + ["本地兜底"] + extra
+
+        # 出口自检：万一上面的决策不合协议，退化成一个必然合法的决策。
+        if not is_valid_decision(decision):
+            decision = build_decision(get_time(request) or now_iso(), "rock")
+            notes.append("出口自检失败->rock")
+
+        return decision, notes
 
     # ------------------------------------------------------------------ #
     # 已写好：输入解析与主循环（不用改）

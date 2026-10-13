@@ -70,7 +70,33 @@ def strip_code_fence(text: str) -> str:
 
     目标：``tests/test_json_guard.py`` 里的 5 个 ``test_strip_code_fence_*`` 通过。
     """
-    raise NotImplementedError("TODO 1：实现 strip_code_fence（见函数文档里的提示）")
+    if not isinstance(text, str) or "```" not in text:
+        return text
+
+    # 用 ``` 切分后，奇数下标（1、3、5…）的片段才是围栏「内部」。
+    # 没有结束围栏时 split 天然只给出最后一段，等价于「取到文本结尾」。
+    parts = text.split("```")
+    bodies: List[str] = []
+    for index in range(1, len(parts), 2):
+        body = parts[index]
+        first_break = body.find("\n")
+        if first_break != -1:
+            label = body[:first_break].strip()
+            # ```json / ```JSON / ```js 这类语言标记行要丢掉；
+            # 但只要这一行里已经有 "{"，说明它本身就是正文，不能丢。
+            if len(label) <= 20 and "{" not in label:
+                body = body[first_break + 1:]
+        body = body.strip()
+        if body:
+            bodies.append(body)
+
+    if not bodies:  # 有围栏但里面是空的，当作没有围栏
+        return text
+    # 围栏可能夹在自然语言中间；多个围栏时优先挑「看起来是 JSON 对象」的那个。
+    for body in bodies:
+        if body.startswith("{"):
+            return body
+    return bodies[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -89,7 +115,44 @@ def find_first_json_object(text: str) -> Optional[str]:
 
     目标：``tests/test_json_guard.py`` 里的 6 个 ``test_find_first_json_object_*`` 通过。
     """
-    raise NotImplementedError("TODO 2：实现 find_first_json_object（见函数文档里的提示）")
+    if not isinstance(text, str):
+        return None
+
+    length = len(text)
+    start = 0
+    while start < length:
+        if text[start] != "{":
+            start += 1
+            continue
+
+        # 从 start 处的 "{" 开始扫：字符串内部的 { } 不参与计数，
+        # 被反斜杠转义的 \" 也不算字符串结束。
+        depth = 0
+        in_string = False
+        escaped = False
+        index = start
+        while index < length:
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:  # 配平了，这一段就是要找的对象
+                    return text[start:index + 1]
+            index += 1
+
+        start += 1  # 这个 "{" 始终没配平，换下一个 "{" 继续试
+
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -222,7 +285,21 @@ def repair_json_text(text: str) -> str:
 
     目标：``tests/test_json_guard.py`` 里的 9 个 ``test_repair_*`` 通过。
     """
-    raise NotImplementedError("TODO 3：实现 repair_json_text（见函数文档里的提示）")
+    if not isinstance(text, str):
+        return text
+
+    # 1) 去掉 // 与 /* */ 注释（字符串里的斜杠会被保护，例如 https://）
+    repaired = _strip_comments(text).strip()
+    # 2) Python 字面量 None / True / False -> null / true / false
+    repaired = _PY_LITERAL_RE.sub(lambda match: _PY_LITERALS[match.group(1)], repaired)
+    # 3) 去掉「逗号后面只跟 } 或 ]」的尾随逗号：{"a": 1,} -> {"a": 1}
+    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+    # 4) 去掉结尾多余的逗号与空白
+    repaired = re.sub(r"([}\]])[\s,]*$", r"\1", repaired)
+    # 5) 统一引号（单引号 / 中文引号）并把字符串里的裸换行、制表符转义
+    repaired = _normalize_strings(repaired)
+    # 6) 补齐缺失的右引号与右括号（模型被截断时最常见）
+    return _close_unfinished(repaired)
 
 
 # --------------------------------------------------------------------------- #

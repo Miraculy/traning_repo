@@ -144,7 +144,10 @@ def normalize_option(value: Any) -> Optional[str]:
 
     目标：``tests/test_rules.py`` 的 ``test_normalize_option_*`` 与 ``test_aliases_*`` 通过。
     """
-    raise NotImplementedError("TODO 4：实现 normalize_option（见函数文档里的提示）")
+    if not isinstance(value, str):
+        return None
+    # 大小写、前后空格、复数、中文写法都由 ALIASES 一张表统一收口。
+    return ALIASES.get(value.strip().lower())
 
 
 # --------------------------------------------------------------------------- #
@@ -188,7 +191,36 @@ def validate_decision(candidate: Any, request: Dict[str, Any]) -> Tuple[Dict[str
 
     目标：``tests/test_rules.py`` 的 ``test_validate_decision_*`` 通过。
     """
-    raise NotImplementedError("TODO 5：实现 validate_decision（见函数文档里的提示）")
+    notes: List[str] = []
+
+    # 1) 模型给的不是对象：连字段都没有，直接兜底。
+    if not isinstance(candidate, dict):
+        decision, extra = fallback_decision(request)
+        return decision, notes + ["非对象->兜底"] + extra
+
+    # 2) option 缺失或不在枚举里：同样兜底。
+    option = normalize_option(candidate.get("option"))
+    if option is None:
+        decision, extra = fallback_decision(request)
+        return decision, notes + ["option 非法->兜底"] + extra
+
+    # 3) time 以网关收到的请求为准 —— 网关是可信边界，模型自报的 time 不可信，
+    #    下游靠 time 做请求/响应配对，一旦采信模型就会断链。
+    request_time = get_time(request)
+    model_time = normalize_time(candidate.get("time"))
+    if request_time is not None:
+        if model_time is not None and model_time != request_time:
+            notes.append("丢弃模型的 time")
+        time_value = request_time
+    elif model_time is not None:
+        notes.append("请求无 time->用模型的 time")
+        time_value = model_time
+    else:
+        notes.append("请求无 time->用当前时间")
+        time_value = now_iso()
+
+    # 4) 出口统一走 build_decision，保证只带 time / option 两个键。
+    return build_decision(time_value, option), notes
 
 
 # --------------------------------------------------------------------------- #
@@ -215,7 +247,18 @@ def fallback_decision(request: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str
 
     目标：``tests/test_rules.py`` 的 ``test_fallback_decision_*`` 通过。
     """
-    raise NotImplementedError("TODO 6：实现 fallback_decision（见函数文档里的提示）")
+    # 兜底策略：反制对手的上一手；没有历史可依据时出 rock。
+    history = history_of(request)
+    if history:
+        last = history[-1]
+        option = counter_to(last)
+        notes = ["兜底:counter(%s)" % last]
+    else:
+        option = "rock"
+        notes = ["兜底:rock"]
+
+    time_value = get_time(request) or now_iso()
+    return build_decision(time_value, option), notes
 
 
 # --------------------------------------------------------------------------- #

@@ -120,7 +120,25 @@ class LlmClient:
 
     目标：``tests/test_client.py`` 的 ``test_body_*`` 与 ``test_prompt_contains_json_word_for_json_mode`` 通过。
         """
-        raise NotImplementedError("TODO 7：实现 build_body（见函数文档里的提示）")
+        # 请求体里的 user 消息 = 固定前缀 + 本轮请求的紧凑 JSON（中文不转义，省 token 又好读）。
+        user_content = USER_PREFIX + json.dumps(
+            request, ensure_ascii=False, separators=(",", ":")
+        )
+        body: Dict[str, Any] = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            "stream": False,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+            # 思考模式会把预算花在思维链上，默认关掉；要开就显式发 enabled。
+            "thinking": {"type": "enabled" if self.config.enable_thinking else "disabled"},
+        }
+        if self.config.enable_json_format:
+            body["response_format"] = {"type": "json_object"}
+        return body
 
     # ------------------------------------------------------------------ #
     # TODO 8：发送（带重试）
@@ -147,7 +165,86 @@ class LlmClient:
 
     目标：``tests/test_client.py`` 的 ``test_decide_*`` 通过。
         """
-        raise NotImplementedError("TODO 8：实现 decide（见函数文档里的提示）")
+        if not self.api_key:
+            raise LlmAuthError(
+                "没有可用的 API Key（config.api_key 为空且环境变量 %s 未设置）"
+                % self.config.api_key_env
+            )
+        if self._closed:
+            raise LlmError("客户端已关闭，不能继续请求上游")
+
+        body = self.build_body(request)
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = self.build_headers()
+        timeout = (self.config.connect_timeout, self.config.request_timeout)
+        attempts = max(1, self.config.max_retries + 1)
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            started = time.monotonic()
+            try:
+                # requests.Session 复用连接，并发调用时串行化，避免连接池互相干扰。
+                with self._lock:
+                    response = self._session.post(
+                        self.endpoint, data=payload, headers=headers, timeout=timeout
+                    )
+                latency = time.monotonic() - started
+                status = response.status_code
+
+                if status == 200:
+                    content, has_reasoning, finish_reason = self.extract_content(response)
+                    return content, {
+                        "attempt": attempt,
+                        "http_status": status,
+                        "latency_s": round(latency, 3),
+                        "has_reasoning": has_reasoning,
+                        "finish_reason": finish_reason,
+                    }
+
+                detail = str(getattr(response, "text", "") or "")[:300].replace("\n", " ")
+
+                if status in (401, 403):
+                    # Key 缺失或无效：重试只会浪费配额，还可能触发风控。
+                    raise LlmAuthError("上游拒绝了这个 API Key（HTTP %d）：%s" % (status, detail))
+                if status == 400:
+                    # 模型名错 / 参数非法：请求本身有问题，重试多少次结果都一样。
+                    raise LlmFatalError("上游返回 HTTP 400（请求本身有问题，重试无意义）：%s" % detail)
+
+                if status in RETRY_STATUS and attempt < attempts:
+                    response_headers = getattr(response, "headers", None) or {}
+                    delay = self.retry_delay(attempt, response_headers.get("Retry-After"))
+                    self._log(
+                        "HTTP %d，%.2fs 后重试（第 %d/%d 次机会）"
+                        % (status, delay, attempt, attempts - 1)
+                    )
+                    self._sleep(delay)
+                    continue
+
+                raise LlmError("上游返回 HTTP %d：%s" % (status, detail))
+
+            except (LlmAuthError, LlmFatalError):
+                raise  # 放在最前面，绝不能让它们掉进下面「可重试」的分支
+            except LlmError as exc:
+                # 空回复、响应结构异常、重试白名单外的状态码都走这里：还有机会就退避重试。
+                last_error = exc
+                if attempt >= attempts:
+                    raise
+                delay = self.retry_delay(attempt, None)
+                self._log("%s；%.2fs 后重试（第 %d/%d 次机会）" % (exc, delay, attempt, attempts - 1))
+                self._sleep(delay)
+            except requests.exceptions.RequestException as exc:
+                # 连接失败 / 超时等网络层错误，同样值得退避重试。
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                delay = self.retry_delay(attempt, None)
+                self._log(
+                    "网络错误 %s：%s；%.2fs 后重试（第 %d/%d 次机会）"
+                    % (type(exc).__name__, exc, delay, attempt, attempts - 1)
+                )
+                self._sleep(delay)
+
+        raise LlmError("上游不可用（已尝试 %d 次）：%s" % (attempts, last_error or "未知错误"))
 
     # ------------------------------------------------------------------ #
     # TODO 9：取出答案
@@ -169,4 +266,34 @@ class LlmClient:
 
     目标：``tests/test_client.py`` 的 ``test_extract_content_*`` 通过。
         """
-        raise NotImplementedError("TODO 9：实现 extract_content（见函数文档里的提示）")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise LlmError("上游返回的不是合法 JSON：%s" % exc) from exc
+
+        if not isinstance(data, dict):
+            raise LlmError("上游返回的 JSON 顶层不是对象：%r" % (data,))
+        choices = data.get("choices") or []
+        if not choices:
+            raise LlmError("上游响应里没有 choices：%s" % (data.get("error") or data))
+
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        finish_reason = str(choice.get("finish_reason") or "")
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            message = {}
+
+        reasoning = message.get("reasoning_content")
+        has_reasoning = isinstance(reasoning, str) and bool(reasoning.strip())
+        content = message.get("content")
+
+        if not isinstance(content, str) or not content.strip():
+            # content 为空有三种完全不同的原因，错误信息必须区分开，否则排查时会被误导：
+            if has_reasoning:
+                # 思维链不是答案，绝不能拿它当 content 用。
+                raise LlmError("上游只返回了 reasoning_content（思维链），content 为空")
+            if finish_reason == "length":
+                raise LlmError("上游 content 为空且 finish_reason=length：max_tokens 不够用")
+            raise LlmError("上游 content 为空（finish_reason=%s）" % finish_reason)
+
+        return content, has_reasoning, finish_reason
